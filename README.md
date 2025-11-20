@@ -39,7 +39,8 @@ AWS リソースの自動停止・自動起動用の CloudFormation テンプレ
 
 | 領域 | 起動ボタン |
 |------|------------|
-| ap-northeast-1 (東京) | [![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home?region=ap-northeast-1#/stacks/new?stackName=autostop-template&templateURL=https://raw.githubusercontent.com/your-repo/lg-autostop-template/main/AutoStopInstanceTemplate.yaml) |
+| ap-northeast-1 (東京) | [![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home?region=ap-northeast-1#/stacks/new?stackName=sample-costsavings-solution) |
+
 
 パラメータを変更する場合は下記の表を参考にしてください。  
 | パラメータ | 説明 | デフォルト値 | 変更の必要性 | 変更内容 |
@@ -75,8 +76,7 @@ Value: t3.small,t3.medium,t4g.small
 ## リソースの削除方法
 ### 1. スタックの削除
 マネジメントコンソールから作成したスタックを指定して削除してください。
-スタックの削除方法の詳細は以下の User Guide を参考にしてください。  
-https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-delete-stack.html
+スタックの削除方法の詳細は [User Guide](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-delete-stack.html) を参考にしてください。  
 
 
 ### 2. 既存リソースのタグ付け解除
