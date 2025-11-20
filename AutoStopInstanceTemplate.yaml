@@ -1,0 +1,1884 @@
+# ------------------------------------------------------------#
+# ご留意事項
+# ------------------------------------------------------------# 
+# ■ 本テンプレートはあくまで実装例・サンプルとなります。
+# そのため正確性や安全性を保障するものでないため、実環境でのご利用に際しては、貴社にて十分なテストの実施や、
+# 必要に応じて修正をお願いいたします。
+# ■ 本テンプレートはガバメントクラウドやAWSサービスの仕様変更、追加などにより今後修正を要する可能性があります。
+# ■ 本テンプレートの利用によって生じた損害等の責任は利用者が負うものとし、
+# アマゾン ウェブ サービス ジャパン は一切の責任を負いません
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: 
+  solution for system autostop
+
+# ------------------------------------------------------------#
+# Parameters
+# ------------------------------------------------------------# 
+Parameters:
+
+  EmailAddress:
+    Type: String
+    Description: "An email address to notify when the status of statemachine change."
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+    NoEcho: true  # Security: Hide email in console/logs
+
+  AutoStopScheduling:
+    Type: String
+    Description: "The schedule for stopping the instances. 
+      Following is a cron expression in JST time. 
+      Example: 'cron(0 12 * * ? *)' means every day at 12:00 JST."
+    Default: "cron(0 12 * * ? *)"
+    AllowedPattern: '^(cron|rate)\(.+\)$'
+    ConstraintDescription: Must be a valid cron or rate expression format like 'cron(0 12 * * ? *)' or 'rate(1 hour)'  # Security: Prevent injection
+
+  AutoStartScheduling:
+    Type: String
+    Description: "The schedule for starting the instances. 
+      Following is a cron expression in JST time. 
+      Example: 'cron(5 12 * * ? *)' means every day at 12:05 JST."
+    Default: "cron(5 12 * * ? *)"
+    AllowedPattern: '^(cron|rate)\(.+\)$'
+    ConstraintDescription: Must be a valid cron or rate expression format like 'cron(0 12 * * ? *)' or 'rate(1 hour)'  # Security: Prevent injection
+
+  FlgDemo:
+    Type: String
+    Description: "Flag to create computing resources for demo. 
+      If you want to create demo resources, set this to 'true'. 
+      If you want to create only the necessary resources, set this to 'false'."
+    AllowedValues: [true, false]
+    Default: "false"
+
+  AutoStopTarget:
+    Type: String
+    Description: "Flag to set the target for auto stop and start."
+    Default: "true"
+
+  NamePrefix:
+    Type: String
+    Description: "Tag value to be used for resources created by this template. 
+      This value will be used as a prefix for resource names."
+    Default: "autostop"
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    MaxLength: 20
+    ConstraintDescription: Must start with letter, contain only alphanumeric and hyphens, max 20 chars  # Security: Prevent injection
+  
+Mappings:
+  SystemConfig:
+    Config:
+      MasterUsername: "admin"
+      AlternativeInstanceType: "t2.micro,t3.micro,t4g.micro"
+      AvailabilityZone1: "ap-northeast-1a"
+      AvailabilityZone2: "ap-northeast-1c"
+      EC2ImageId: "ami-0d52744d6551d851e"
+      EC2InstanceType: "t3.micro"
+      RDSInstanceClass: "db.t3.micro"
+
+Conditions:
+  FlgDemoResource: !Equals [!Ref FlgDemo, "true"]
+
+Resources: 
+# ------------------------------------------------------------#
+#  VPC
+# ------------------------------------------------------------#
+# VPC Create
+  VPC: 
+    Type: "AWS::EC2::VPC"
+    Condition: FlgDemoResource
+    Properties: 
+      CidrBlock: "10.10.0.0/16"
+      EnableDnsSupport: "true"
+      EnableDnsHostnames: "true"
+      InstanceTenancy: default
+      Tags: 
+        - Key: Name
+          Value: !Sub "${NamePrefix}-vpc-main-${AWS::StackName}"
+
+# ------------------------------------------------------------#
+#  InternetGateway
+# ------------------------------------------------------------#  
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: FlgDemoResource
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-igw-main-${AWS::StackName}"
+
+  InternetGatewayAttachment: 
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Condition: FlgDemoResource
+    Properties: 
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC 
+
+# ------------------------------------------------------------#
+#  Subnet
+# ------------------------------------------------------------#          
+# PublicSubnetA
+  PublicSubnetA: 
+    Type: "AWS::EC2::Subnet"
+    Condition: FlgDemoResource
+    Properties: 
+      AvailabilityZone: !FindInMap [SystemConfig, Config, AvailabilityZone1]
+      CidrBlock: "10.10.11.0/24"
+      VpcId: !Ref VPC 
+      Tags: 
+        - Key: Name
+          Value: !Sub "${NamePrefix}-subnet-public-${AWS::StackName}"
+
+# PublicSubnetC
+  PublicSubnetC: 
+    Type: "AWS::EC2::Subnet"
+    Condition: FlgDemoResource
+    Properties: 
+      AvailabilityZone: !FindInMap [SystemConfig, Config, AvailabilityZone2]
+      CidrBlock: "10.10.21.0/24"
+      VpcId: !Ref VPC 
+      Tags: 
+        - Key: Name
+          Value: !Sub "${NamePrefix}-subnet-public-${AWS::StackName}"
+
+# Private Subnets for Lambda
+  PrivateSubnetA:
+    Type: "AWS::EC2::Subnet"
+    Condition: FlgDemoResource
+    Properties:
+      AvailabilityZone: !FindInMap [SystemConfig, Config, AvailabilityZone1]
+      CidrBlock: "10.10.31.0/24"
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-subnet-private${AWS::StackName}"
+
+  PrivateSubnetC:
+    Type: "AWS::EC2::Subnet"
+    Condition: FlgDemoResource
+    Properties:
+      AvailabilityZone: !FindInMap [SystemConfig, Config, AvailabilityZone2]
+      CidrBlock: "10.10.41.0/24"
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-subnet-private${AWS::StackName}"
+
+# ------------------------------------------------------------#
+#  RouteTable
+# ------------------------------------------------------------#          
+#  Create route table
+  RouteTable: 
+    Type: "AWS::EC2::RouteTable"
+    Condition: FlgDemoResource
+    Properties: 
+      VpcId: !Ref VPC 
+      Tags: 
+        - Key: Name
+          Value: !Sub "${NamePrefix}-vpc-routetable-${AWS::StackName}"
+
+# Define routing rule
+  RouteDef: 
+    Type: "AWS::EC2::Route"
+    Condition: FlgDemoResource
+    Properties: 
+      RouteTableId: !Ref RouteTable 
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway 
+
+# Associate route table to subnet
+  RouteTableAssociationA: 
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Condition: FlgDemoResource
+    Properties: 
+      SubnetId: !Ref PublicSubnetA 
+      RouteTableId: !Ref RouteTable
+
+  RouteTableAssociationC: 
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Condition: FlgDemoResource
+    Properties: 
+      SubnetId: !Ref PublicSubnetC 
+      RouteTableId: !Ref RouteTable
+
+# NAT Gateway
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    Condition: FlgDemoResource
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-eip-natgw-${AWS::StackName}"
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: FlgDemoResource
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-natgw-${AWS::StackName}"
+
+# Private Route Table
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: FlgDemoResource
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-private-routetable-${AWS::StackName}"
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Condition: FlgDemoResource
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NATGateway
+
+  PrivateRouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: FlgDemoResource
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateRouteTableAssociationC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: FlgDemoResource
+    Properties:
+      SubnetId: !Ref PrivateSubnetC
+      RouteTableId: !Ref PrivateRouteTable
+
+# ------------------------------------------------------------#
+#  SecurityGroup
+# ------------------------------------------------------------#
+# EC2 Security Group (restrictive egress)
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: FlgDemoResource
+    Properties:
+      GroupDescription: "Security group for EC2 instances (restrictive egress)"
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: "tcp"
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow HTTPS for AWS API calls"  # Security: Only allow necessary HTTPS traffic
+        - IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow HTTP for package updates"  # Security: Allow HTTP for updates only
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-securitygroup-ec2-${AWS::StackName}"
+
+# ECS Security Group (allow HTTPS outbound only)
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: FlgDemoResource
+    Properties:
+      GroupDescription: "Security group for ECS services (allow HTTPS outbound only)"
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: "tcp"
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow HTTPS outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-securitygroup-ecs-${AWS::StackName}"
+
+# Lambda Security Group
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: FlgDemoResource
+    Properties:
+      GroupDescription: "Security group for Lambda functions"
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: "tcp"
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow HTTPS outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-securitygroup-lambda-${AWS::StackName}"
+
+# ------------------------------------------------------------#
+#  EC2
+# ------------------------------------------------------------#  
+# Operation Server 
+  OperationServer: 
+    Type: AWS::EC2::Instance
+    Condition: FlgDemoResource
+    Properties: 
+      ImageId: !FindInMap [SystemConfig, Config, EC2ImageId]
+      InstanceType: !FindInMap [SystemConfig, Config, EC2InstanceType]
+      EbsOptimized: true
+      Monitoring: true
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      BlockDeviceMappings:  # Security: Encrypt EBS volumes
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            VolumeType: "gp3"
+            VolumeSize: 20
+            Encrypted: true
+            DeleteOnTermination: true
+      MetadataOptions:  # Security: Secure IMDS configuration
+        HttpTokens: "required"
+        HttpPutResponseHopLimit: 1
+        HttpEndpoint: "enabled"
+      Tags:
+          - Key: Name
+            Value: !Sub "${NamePrefix}-ec2-operation-${AWS::StackName}"
+          - Key: AutoStopTarget
+            Value: !Sub "${AutoStopTarget}"
+          - Key: AlternativeInstanceType
+            Value: !FindInMap [SystemConfig, Config, AlternativeInstanceType]
+
+
+# ------------------------------------------------------------#
+#  ECS Cluster
+# ------------------------------------------------------------#  
+  ECSCluster:
+    Type: "AWS::ECS::Cluster"
+    Condition: FlgDemoResource
+    Properties:
+      ClusterName: !Sub "${NamePrefix}-ecs-cluster-${AWS::StackName}"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-ecs-cluster-${AWS::StackName}"
+
+# ------------------------------------------------------------#
+#  KMS Key for CloudWatch Logs
+# ------------------------------------------------------------#
+  CloudWatchLogsKMSKey:
+    Type: AWS::KMS::Key
+    Condition: FlgDemoResource
+    Properties:
+      Description: "KMS Key for CloudWatch Logs encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+            Condition:
+              ArnEquals:
+                "kms:EncryptionContext:aws:logs:arn": !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/logs/${NamePrefix}-${AWS::StackName}"
+
+  CloudWatchLogsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: FlgDemoResource
+    Properties:
+      AliasName: !Sub "alias/${NamePrefix}-logs-${AWS::StackName}"
+      TargetKeyId: !Ref CloudWatchLogsKMSKey
+
+# ------------------------------------------------------------#
+#  LogGroup for ECS
+# ------------------------------------------------------------#  
+  TestEcsLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Condition: FlgDemoResource
+    Properties:
+      LogGroupName: !Sub "/ecs/logs/${NamePrefix}-${AWS::StackName}"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt CloudWatchLogsKMSKey.Arn
+
+# ------------------------------------------------------------#
+#  ECS Task def
+# ------------------------------------------------------------# 
+# task definition for web container
+  EcsTaskDefWeb:
+    Type: "AWS::ECS::TaskDefinition"
+    Condition: FlgDemoResource
+    Properties:
+      Cpu: 256
+      ExecutionRoleArn: !Ref IAMEcsTaskExec
+      Family: "autostop-taskdef-web"
+      Memory: 512
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-ecs-taskdefweb-${AWS::StackName}"
+      ### ContainerDefinitions
+      ContainerDefinitions:
+        - Name: "autostop-task-web"
+          Image: "public.ecr.aws/docker/library/tomcat:9.0"  # Security: Use Tomcat (default port 8080)
+          User: "1000:1000"  # Security: Run as non-root user
+          ReadonlyRootFilesystem: true  # Security: Read-only root filesystem
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TestEcsLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: "web"
+          MemoryReservation: 128
+          PortMappings:
+            - HostPort: 8080
+              Protocol: tcp
+              ContainerPort: 8080  # Security: Tomcat default port (non-privileged)
+
+# ------------------------------------------------------------#
+#  ECS Service
+# ------------------------------------------------------------# 
+# Service
+  EcsService:
+    Type: "AWS::ECS::Service"
+    Condition: FlgDemoResource
+    Properties:
+      Cluster: !Ref ECSCluster
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+          Subnets:
+            - !GetAtt PrivateSubnetA.SubnetId
+            - !GetAtt PrivateSubnetC.SubnetId
+      ServiceName: !Sub "${NamePrefix}-ecs-service-${AWS::StackName}"
+      TaskDefinition: !Ref EcsTaskDefWeb
+      Tags: 
+        - Key: "Name"
+          Value: !Sub "${NamePrefix}-ecs-service-${AWS::StackName}"
+        - Key: "AutoStopTarget"
+          Value: !Sub "${AutoStopTarget}"
+        - Key: "DesiredCount"
+          Value: 1
+
+# ------------------------------------------------------------#
+#  IAM
+# ------------------------------------------------------------# 
+# IAM Policies
+  StateMachinePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${NamePrefix}-statemachine-policy-${AWS::StackName}"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "ec2:StartInstances"
+              - "ec2:StopInstances"
+              - "ec2:ModifyInstanceAttribute"
+            Resource: 
+              - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+            Condition:  # Security: Restrict to tagged resources only
+              StringEquals:
+                "ec2:ResourceTag/AutoStopTarget": !Ref AutoStopTarget
+          - Effect: Allow
+            Action:
+              - "rds:StartDBInstance"
+              - "rds:StopDBInstance"
+            Resource: 
+              - !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:*"
+            Condition:  # Security: Restrict to tagged resources only
+              StringEquals:
+                "rds:db-tag/AutoStopTarget": !Ref AutoStopTarget
+          - Effect: Allow
+            Action:
+              - "ecs:UpdateService"
+              - "ecs:DescribeServices"
+            Resource: 
+              - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/*"
+            Condition:  # Security: Restrict to tagged resources only
+              StringEquals:
+                "ecs:ResourceTag/AutoStopTarget": !Ref AutoStopTarget
+          - Effect: Allow
+            Action:
+              - "lambda:InvokeFunction"
+            Resource: 
+              - !GetAtt SystemStatusCheckFunction.Arn
+              - !GetAtt StartInstancesFunction.Arn
+              - !GetAtt ICERecoveryFunction.Arn
+      Roles:
+        - !Ref IAMStateMachineRole
+
+# StateMachine
+  IAMStateMachineRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonRDSReadOnlyAccess
+        - arn:aws:iam::aws:policy/ResourceGroupsandTagEditorReadOnlyAccess
+
+  EventBridgePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${NamePrefix}-eventbridge-policy-${AWS::StackName}"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "states:StartExecution"
+              - "states:DescribeExecution"
+            Resource: 
+              - !GetAtt AutoStopStatemachine.Arn
+              - !GetAtt AutoStartStatemachine.Arn
+          - Effect: Allow
+            Action:
+              - "sns:Publish"
+            Resource: 
+              - !Ref NotificationTopic
+      Roles:
+        - !Ref IAMEventBridge
+
+# EventBridge scheduler
+  IAMEventBridge:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - scheduler.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+  EventBridgeRulePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${NamePrefix}-eventbridge-rule-policy-${AWS::StackName}"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "sns:Publish"
+            Resource: 
+              - !Ref NotificationTopic
+      Roles:
+        - !Ref IAMEventBridgeRule
+
+# EventBridge rule
+  IAMEventBridgeRule:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+# Lambda
+  IAMLambdaStatusCheck:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - "sts:AssumeRole"
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+          - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+          - arn:aws:iam::aws:policy/AmazonRDSReadOnlyAccess
+
+  LambdaStatusCheckPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${NamePrefix}-lambda-statuscheck-policy-${AWS::StackName}"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: 
+              - "logs:CreateLogGroup" 
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: 
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${NamePrefix}-lambda-statuscheck-${AWS::StackName}*"
+          - Effect: Allow
+            Action:
+              - "sqs:SendMessage"
+            Resource: 
+              - !GetAtt LambdaDLQQueue.Arn
+      Roles:
+        - !Ref IAMLambdaStatusCheck
+
+# Lambda ec2 start or stop role
+  IAMLambdaStartInstances:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - "sts:AssumeRole"
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+          - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+
+  LambdaStartInstancesPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${NamePrefix}-lambda-startinstances-policy-${AWS::StackName}"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: 
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: 
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${NamePrefix}-lambda-startinstances-${AWS::StackName}*"
+          - Effect: Allow
+            Action:
+              - "ec2:StartInstances"
+            Resource: 
+              - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+            Condition:  # Security: Restrict to tagged resources only
+              StringEquals:
+                "ec2:ResourceTag/AutoStopTarget": !Ref AutoStopTarget
+          - Effect: Allow
+            Action:
+              - "sqs:SendMessage"
+            Resource: 
+              - !GetAtt LambdaDLQQueue.Arn
+      Roles:
+        - !Ref IAMLambdaStartInstances
+
+# Lambda recovery insufficient capacity role
+  IAMLambdaRecoveryInsufficientCapacity:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - "sts:AssumeRole"
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+          - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+
+  LambdaRecoveryPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${NamePrefix}-lambda-recovery-policy-${AWS::StackName}"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: 
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: 
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${NamePrefix}-lambda-recovery-${AWS::StackName}*"
+          - Effect: Allow
+            Action:
+              - "ec2:StartInstances"
+              - "ec2:StopInstances"
+              - "ec2:ModifyInstanceAttribute"
+            Resource: 
+              - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+            Condition:  # Security: Restrict to tagged resources only
+              StringEquals:
+                "ec2:ResourceTag/AutoStopTarget": !Ref AutoStopTarget
+          - Effect: Allow
+            Action:
+              - "sqs:SendMessage"
+            Resource: 
+              - !GetAtt LambdaDLQQueue.Arn
+      Roles:
+        - !Ref IAMLambdaRecoveryInsufficientCapacity
+
+# EC2 Instance Role
+  IAMEc2InstanceRole:
+    Type: AWS::IAM::Role
+    Condition: FlgDemoResource
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: FlgDemoResource
+    Properties:
+      Roles:
+        - !Ref IAMEc2InstanceRole
+
+# ECS
+  IAMEcsTaskExec:
+    Type: AWS::IAM::Role
+    Condition: FlgDemoResource
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+# ------------------------------------------------------------#
+#  ResourceGroup
+# ------------------------------------------------------------# 
+  ResourceGroup:
+    Type: AWS::ResourceGroups::Group
+    Properties:
+      Name: !Sub "${NamePrefix}-resourcegroup-target-${AWS::StackName}"
+      ResourceQuery:
+        Type: TAG_FILTERS_1_0
+        Query:
+          ResourceTypeFilters:
+            - AWS::EC2::Instance
+            - AWS::RDS::DBInstance
+            - AWS::ECS::Service
+          TagFilters:
+            - Key: "AutoStopTarget"
+              Values: 
+                - !Ref AutoStopTarget
+
+# ------------------------------------------------------------#
+#  SQS DLQ
+# ------------------------------------------------------------#
+  LambdaDLQQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${NamePrefix}-lambda-dlq-${AWS::StackName}"
+      MessageRetentionPeriod: 604800
+      KmsMasterKeyId: "alias/aws/sqs"
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-lambda-dlq-${AWS::StackName}"
+
+# ------------------------------------------------------------#
+#  KMS Key for Lambda CloudWatch Logs
+# ------------------------------------------------------------#
+  LambdaLogsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "KMS Key for Lambda CloudWatch Logs encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+
+  LambdaLogsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${NamePrefix}-lambda-logs-${AWS::StackName}"
+      TargetKeyId: !Ref LambdaLogsKMSKey
+
+# ------------------------------------------------------------#
+#  CloudWatch Logs Groups for Lambda
+# ------------------------------------------------------------#
+  SystemStatusCheckLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${NamePrefix}-lambda-statuscheck-${AWS::StackName}"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt LambdaLogsKMSKey.Arn
+
+  StartInstancesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${NamePrefix}-lambda-startinstances-${AWS::StackName}"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt LambdaLogsKMSKey.Arn
+
+  ICERecoveryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${NamePrefix}-lambda-recovery-${AWS::StackName}"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt LambdaLogsKMSKey.Arn
+
+  VPCFlowLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: FlgDemoResource
+    Properties:
+      LogGroupName: !Sub "/aws/vpc/flowlogs/${NamePrefix}-${AWS::StackName}"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt LambdaLogsKMSKey.Arn
+
+# ------------------------------------------------------------#
+#  VPC Flow Logs
+# ------------------------------------------------------------#
+  VPCFlowLogsRole:
+    Type: AWS::IAM::Role
+    Condition: FlgDemoResource
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: flowlogsDeliveryRolePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:DescribeLogGroups"
+                  - "logs:DescribeLogStreams"
+                Resource: 
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vpc/flowlogs/${NamePrefix}-${AWS::StackName}*"
+
+  VPCFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Condition: FlgDemoResource
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VPCFlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-vpc-flowlogs-${AWS::StackName}"
+
+# ------------------------------------------------------------#
+#  Lambda
+# ------------------------------------------------------------#  
+# System status check function
+# AutoStop
+  SystemStatusCheckFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SystemStatusCheckLogGroup
+    Properties:
+      FunctionName: !Sub "${NamePrefix}-lambda-statuscheck-${AWS::StackName}"
+      Role: !GetAtt IAMLambdaStatusCheck.Arn
+      Runtime: python3.13
+      Timeout: 600
+      Handler: index.lambda_handler
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQQueue.Arn
+      VpcConfig: !If
+        - FlgDemoResource
+        - SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+          SubnetIds:
+            - !Ref PrivateSubnetA
+            - !Ref PrivateSubnetC
+        - !Ref "AWS::NoValue"
+      Code:
+        ZipFile: !Sub |
+          import json
+          import time
+          import boto3
+
+          def check_ec2_stopped(ec2, instance_ids):
+              if not instance_ids:
+                  return True
+              waiter = ec2.get_waiter('instance_stopped')
+              print("Waiting for EC2 instances to stop...")
+              waiter.wait(InstanceIds=instance_ids)
+              return True
+
+          def check_ec2_running(ec2, instance_ids):
+              if not instance_ids:
+                  return True
+              waiter = ec2.get_waiter('instance_running')
+              print("Waiting for EC2 instances to start...")
+              waiter.wait(InstanceIds=instance_ids)
+              return True
+
+          def check_rds_stopped(rds, db_instances):
+              for db in db_instances:
+                  while True:
+                      status = rds.describe_db_instances(
+                          DBInstanceIdentifier=db
+                      )['DBInstances'][0]['DBInstanceStatus']
+                      print(f"RDS {db} status: {status}")
+                      if status == 'stopped':
+                          break
+                      time.sleep(10)
+              return True
+
+          def check_rds_available(rds, db_instances):
+              for db in db_instances:
+                  while True:
+                      status = rds.describe_db_instances(
+                          DBInstanceIdentifier=db
+                      )['DBInstances'][0]['DBInstanceStatus']
+                      print(f"RDS {db} status: {status}")
+                      if status == 'available':
+                          break
+                      time.sleep(10)
+              return True
+
+          def lambda_handler(event, context):
+              ec2 = boto3.client('ec2', '${AWS::Region}')
+              rds = boto3.client('rds', '${AWS::Region}')
+              
+              # eventから動作モードを取得 (start or stop)
+              action = event.get('action', 'stop')
+              print(f"Action: {action}")
+
+              # EC2インスタンス取得
+              response = ec2.describe_instances(
+                  Filters=[
+                      {'Name': 'tag:AutoStopTarget', 'Values': ['${AutoStopTarget}']},
+                  ]
+              )['Reservations']
+
+              instance_ids = []
+              for reservation in response:
+                  for instance in reservation['Instances']:
+                      if instance['State']['Name'] != 'terminated':
+                          instance_ids.append(instance['InstanceId'])
+              
+              print(f"Target EC2 instances: {instance_ids}")
+
+              # RDSインスタンス取得
+              rds_response = rds.describe_db_instances()['DBInstances']
+              db_instances = []
+              for db in rds_response:
+                  for tag in db['TagList']:
+                      if tag['Key'] == 'AutoStopTarget' and tag['Value'] == '${AutoStopTarget}':
+                          db_instances.append(db['DBInstanceIdentifier'])
+                          break
+              
+              print(f"Target RDS instances: {db_instances}")
+
+              # 動作モードに応じて処理実行
+              if action == 'start':
+                  check_ec2_running(ec2, instance_ids)
+                  check_rds_available(rds, db_instances)
+                  print("All resources are now running/available")
+              else:  # stop
+                  check_ec2_stopped(ec2, instance_ids)
+                  check_rds_stopped(rds, db_instances)
+                  print("All resources are now stopped")
+              
+              return {'statusCode': 200, 'action': action}
+
+
+# Start ec2 instances
+  StartInstancesFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: StartInstancesLogGroup
+    Properties:
+      FunctionName: !Sub "${NamePrefix}-lambda-startinstances-${AWS::StackName}"
+      Role: !GetAtt IAMLambdaStartInstances.Arn
+      Runtime: python3.13
+      Timeout: 600
+      Handler: index.lambda_handler
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQQueue.Arn
+      VpcConfig: !If
+        - FlgDemoResource
+        - SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+          SubnetIds:
+            - !Ref PrivateSubnetA
+            - !Ref PrivateSubnetC
+        - !Ref "AWS::NoValue"
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          from botocore.exceptions import ClientError
+
+          def lambda_handler(event, context):
+              ec2_client = boto3.client('ec2', '${AWS::Region}')
+              print("Starting EC2 instance:", event['InstanceId'])
+              try:
+                  response = ec2_client.start_instances(
+                      InstanceIds=[event['InstanceId']]
+                  )
+                  return {
+                      'result': 'success',
+                      'response': response
+                  }
+              except ClientError as e:
+                  return {
+                      'result': 'error',
+                      'errorCode': e.response['Error']['Code'],
+                      'errorMessage': e.response['Error']['Message']
+                  }
+
+# RecoveryInsufficientCapacity
+  ICERecoveryFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ICERecoveryLogGroup
+    Properties:
+      FunctionName: !Sub "${NamePrefix}-lambda-recovery-${AWS::StackName}"
+      Role: !GetAtt IAMLambdaRecoveryInsufficientCapacity.Arn
+      Runtime: python3.13
+      Timeout: 600
+      Handler: index.lambda_handler
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQQueue.Arn
+      VpcConfig: !If
+        - FlgDemoResource
+        - SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+          SubnetIds:
+            - !Ref PrivateSubnetA
+            - !Ref PrivateSubnetC
+        - !Ref "AWS::NoValue"
+      Code:
+        ZipFile: !Sub |
+          import json
+          import time
+          import boto3
+
+          def lambda_handler(event, context):
+              ec2_client = boto3.client('ec2', '${AWS::Region}')
+
+              print("Insufficient capacity error occurred.")
+              print("Try launch instance using alternative instance type.")
+
+              try:
+                  print('instanceid is ' + event['InstanceId'])
+                  response = ec2_client.describe_instances(InstanceIds=[event['InstanceId']])['Reservations']
+
+                  alternative_instantypes = []
+                  if len(response) == 1:
+                      for tag in response[0]['Instances'][0]['Tags']:
+                          if tag['Key'] == 'AlternativeInstanceType':
+                              alternative_instantypes = tag['Value'].split(',')
+                              break
+                  else:
+                      print(f'There are multiple target instances or no instances. You should modify and restart the instances one by one when insufficient error occured.')
+                      return None
+                  
+              except Exception as error:
+                  print(f'Error fetching alternative instance type: {error}')
+                  return None
+
+              if len(alternative_instantypes) == 0:
+                  print(f'There is no alternative instance type.')
+                  return None
+              else:
+                  print(f'Following list is alternative instancetypes')
+                  print(alternative_instantypes)
+                  for instancetype in alternative_instantypes:     
+                      try:
+                          print(f'Modifying instance {event['InstanceId']} to type {instancetype}...')
+                          ec2_client.modify_instance_attribute(
+                              InstanceId=event['InstanceId'],
+                              InstanceType={'Value': instancetype}
+                          )
+
+                          time.sleep(2)
+                          print(f'Starting instance {event['InstanceId']}...')
+                          ec2_client.start_instances(InstanceIds=[event['InstanceId']])
+
+                          print(f'Successfully modified and started instance {event['InstanceId']} to type {instancetype}')
+                          break
+                          
+                      except Exception as error:
+                          print(f'Error modifying or starting instance {event['InstanceId']} to type {instancetype}: {error}')
+                          continue
+              
+              return 0
+
+# ------------------------------------------------------------#
+#  StepFunction
+# ------------------------------------------------------------#  
+# StateMachine AutoStop
+  AutoStopStatemachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      Definition: {
+        "Comment": "A description of my state machine",
+        "StartAt": "Parallel",
+        "States": {
+          "Parallel": {
+            "Type": "Parallel",
+            "Branches": [
+              {
+                "StartAt": "GetTargetInstances",
+                "States": {
+                  "GetTargetInstances": {
+                    "Type": "Task",
+                    "Arguments": {
+                      "GroupName": !Ref ResourceGroup,
+                      "Filters": [
+                        {
+                          "Name": "resource-type",
+                          "Values": [
+                            "AWS::EC2::Instance"
+                          ]
+                        }
+                      ]
+                    },
+                    "Resource": "arn:aws:states:::aws-sdk:resourcegroups:listGroupResources",
+                    "Assign": {
+                      "InstanceIds": "{% $map($states.result.ResourceIdentifiers[*].ResourceArn, function($v) { $string($split($v, \"/\")[1]) }) %}"
+                    },
+                    "Next": "DescribeOtherInstances"
+                  },
+                  "DescribeOtherInstances": {
+                    "Type": "Task",
+                    "Arguments": {
+                      "Filters": [
+                        {
+                          "Name": "instance-state-name",
+                          "Values": [
+                            "running"
+                          ]
+                        },
+                        {
+                          "Name": "instance-id",
+                          "Values": "{% $append($InstanceIds, []) %}"
+                        }
+                      ]
+                    },
+                    "Resource": "arn:aws:states:::aws-sdk:ec2:describeInstances",
+                    "Next": "StopOtherInstances",
+                    "Output": "{% $append($states.result.Reservations[*].Instances[*].InstanceId, []) %}"
+                  },
+                  "StopOtherInstances": {
+                    "Type": "Map",
+                    "ItemProcessor": {
+                      "ProcessorConfig": {
+                        "Mode": "INLINE"
+                      },
+                      "StartAt": "StopInstances",
+                      "States": {
+                        "StopInstances": {
+                          "Type": "Task",
+                          "Arguments": {
+                            "InstanceIds": "{% $append($states.input, []) %}"
+                          },
+                          "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
+                          "End": true
+                        }
+                      }
+                    },
+                    "End": true,
+                    "MaxConcurrency": 1
+                  }
+                }
+              },
+              {
+                "StartAt": "GetTargetServices",
+                "States": {
+                  "GetTargetServices": {
+                    "Type": "Task",
+                    "Arguments": {
+                      "GroupName": !Ref ResourceGroup,
+                      "Filters": [
+                        {
+                          "Name": "resource-type",
+                          "Values": [
+                            "AWS::ECS::Service"
+                          ]
+                        }
+                      ]
+                    },
+                    "Resource": "arn:aws:states:::aws-sdk:resourcegroups:listGroupResources",
+                    "Output": "{% $append($distinct($states.result.ResourceIdentifiers[*].ResourceArn), []) %}",
+                    "Next": "MapServices"
+                  },
+                "MapServices": {
+                  "Type": "Map",
+                  "ItemProcessor": {
+                    "ProcessorConfig": {
+                      "Mode": "INLINE"
+                    },
+                    "StartAt": "DescribeServices",
+                    "States": {
+                      "DescribeServices": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:ecs:describeServices",
+                        "Next": "CheckServiceStatus",
+                        "Arguments": {
+                          "Services": "{% $append($map($states.input,function($v) { $string($split($v, \"/\")[2])}), []) %}",
+                          "Cluster": "{% $string($split($states.input, \"/\")[1]) %}",
+                          "Include": [
+                            "TAGS"
+                          ]
+                        },
+                        "Output": {
+                          "Service": "{% $string($map($states.input,function($v) { $string($split($v, \"/\")[2])})) %}",
+                          "Cluster": "{% $string($split($states.input, \"/\")[1]) %}",
+                          "DesiredCount": "{% $number($states.result.Services[*].Tags[Key=\"DesiredCount\"].Value) %}",
+                          "Status": "{% $states.result.Services[*].Status %}"
+                        }
+                      },
+                        "CheckServiceStatus": {
+                          "Type": "Choice",
+                          "Choices": [
+                            {
+                              "Next": "PassUpdate",
+                              "Condition": "{% $states.input.Status != \"ACTIVE\" %}"
+                            },
+                            {
+                              "Next": "UpdateService",
+                              "Condition": "{% $states.input.Status = \"ACTIVE\" %}"
+                            }
+                          ],
+                          "Default": "PassUpdate"
+                        },
+                        "PassUpdate": {
+                          "Type": "Pass",
+                          "End": true
+                        },
+                      "UpdateService": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:ecs:updateService",
+                        "End": true,
+                        "Arguments": {
+                          "Service": "{% $states.input.Service %}",
+                          "Cluster": "{% $states.input.Cluster %}",
+                          "DesiredCount": 0
+                        }
+                      }
+                    }
+                  },
+                  "End": true
+                }
+              }
+              }
+            ],
+            "Next": "GetTargetDatabases"
+          },
+          "GetTargetDatabases": {
+            "Type": "Task",
+            "Arguments": {
+              "GroupName": !Ref ResourceGroup,
+              "Filters": [
+                {
+                  "Name": "resource-type",
+                  "Values": [
+                    "AWS::RDS::DBInstance"
+                  ]
+                }
+              ]
+            },
+            "Resource": "arn:aws:states:::aws-sdk:resourcegroups:listGroupResources",
+            "Output": "{% $append($map($states.result.ResourceIdentifiers[*].ResourceArn, function($v) { $string($split($v, \":\")[6]) }), []) %}",
+            "Next": "StopDBLoop"
+          },
+          "StopDBLoop": {
+            "Type": "Map",
+            "ItemProcessor": {
+              "ProcessorConfig": {
+                "Mode": "INLINE"
+              },
+              "StartAt": "DescribeDBInstances",
+              "States": {
+                "DescribeDBInstances": {
+                  "Type": "Task",
+                  "Arguments": {
+                    "DbInstanceIdentifier": "{% $states.input %}"
+                  },
+                  "Resource": "arn:aws:states:::aws-sdk:rds:describeDBInstances",
+                  "Next": "Choice",
+                  "Output": "{% $states.result %}"
+                },
+                "Choice": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Next": "Pass",
+                      "Condition": "{% $states.input.DbInstances[*].DbInstanceStatus != \"available\"%}"
+                    },
+                    {
+                      "Next": "StopDBInstance",
+                      "Condition": "{% $states.input.DbInstances[*].DbInstanceStatus = \"available\"%}",
+                      "Output": "{% $states.input.DbInstances[*].DbInstanceIdentifier %}"
+                    }
+                  ],
+                  "Default": "Pass"
+                },
+                "StopDBInstance": {
+                  "Type": "Task",
+                  "Arguments": {
+                    "DbInstanceIdentifier": "{% $states.input %}"
+                  },
+                  "Resource": "arn:aws:states:::aws-sdk:rds:stopDBInstance",
+                  "End": true
+                },
+                "Pass": {
+                  "Type": "Pass",
+                  "End": true
+                }
+              }
+            },
+            "MaxConcurrency": 1,
+            "Next": "StatusCheck",
+            "Output": '{"action": "stop"}'
+          },
+          "StatusCheck": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Output": "{% $states.result.Payload %}",
+            "Arguments": {
+              "FunctionName": !GetAtt SystemStatusCheckFunction.Arn,
+              "Payload": "{% $states.input %}"
+              },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 3,
+                "BackoffRate": 2,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "End": true
+          },
+        },
+        "QueryLanguage": "JSONata"
+      }
+      RoleArn: !GetAtt IAMStateMachineRole.Arn
+      StateMachineName: !Sub "${NamePrefix}-statemachine-stop-${AWS::StackName}"
+      StateMachineType: "STANDARD"
+      Tags: 
+        - Key: "Name"
+          Value: !Sub "${NamePrefix}-statemachine-stop-${AWS::StackName}"
+
+
+# StateMachine AutoStart
+  AutoStartStatemachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      Definition: {
+        "Comment": "A description of my state machine",
+        "StartAt": "GetTargetDatabases",
+        "States": {
+          "GetTargetDatabases": {
+            "Type": "Task",
+            "Arguments": {
+              "GroupName": !Ref ResourceGroup,
+              "Filters": [
+                {
+                  "Name": "resource-type",
+                  "Values": [
+                    "AWS::RDS::DBInstance"
+                  ]
+                }
+              ]
+            },
+            "Resource": "arn:aws:states:::aws-sdk:resourcegroups:listGroupResources",
+            "Output": "{% $append($map($states.result.ResourceIdentifiers[*].ResourceArn, function($v) { $string($split($v, \":\")[6]) }), []) %}",
+            "Next": "StartDBLoop"
+          },
+          "StartDBLoop": {
+            "Type": "Map",
+            "ItemProcessor": {
+              "ProcessorConfig": {
+                "Mode": "INLINE"
+              },
+              "StartAt": "DescribeDBInstances",
+              "States": {
+                "DescribeDBInstances": {
+                  "Type": "Task",
+                  "Arguments": {
+                    "DbInstanceIdentifier": "{% $states.input %}"
+                  },
+                  "Resource": "arn:aws:states:::aws-sdk:rds:describeDBInstances",
+                  "Next": "Choice",
+                  "Output": "{% $states.result %}"
+                },
+                "Choice": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Next": "Pass",
+                      "Condition": "{% $states.input.DbInstances[*].DbInstanceStatus != \"stopped\"%}"
+                    },
+                    {
+                      "Next": "StartDBInstance",
+                      "Condition": "{% $states.input.DbInstances[*].DbInstanceStatus = \"stopped\"%}",
+                      "Output": "{% $states.input.DbInstances[*].DbInstanceIdentifier %}"
+                    }
+                  ],
+                  "Default": "Pass"
+                },
+                "StartDBInstance": {
+                  "Type": "Task",
+                  "Arguments": {
+                    "DbInstanceIdentifier": "{% $states.input %}"
+                  },
+                  "Resource": "arn:aws:states:::aws-sdk:rds:startDBInstance",
+                  "End": true
+                },
+                "Pass": {
+                  "Type": "Pass",
+                  "End": true
+                }
+              }
+            },
+            "Next": "Parallel",
+            "MaxConcurrency": 1
+          },
+          "Parallel": {
+            "Type": "Parallel",
+            "Branches": [
+              {
+                "StartAt": "GetTargetInstances",
+                "States": {
+                  "GetTargetInstances": {
+                    "Type": "Task",
+                    "Arguments": {
+                      "GroupName": !Ref ResourceGroup,
+                      "Filters": [
+                        {
+                          "Name": "resource-type",
+                          "Values": [
+                            "AWS::EC2::Instance"
+                          ]
+                        }
+                      ]
+                    },
+                    "Resource": "arn:aws:states:::aws-sdk:resourcegroups:listGroupResources",
+                    "Assign": {
+                      "InstanceIds": "{% $map($states.result.ResourceIdentifiers[*].ResourceArn, function($v) { $string($split($v, \"/\")[1]) }) %}"
+                    },
+                    "Next": "DescribeOtherInstances"
+                  },
+                  "DescribeOtherInstances": {
+                    "Type": "Task",
+                    "Arguments": {
+                      "Filters": [
+                        {
+                          "Name": "instance-state-name",
+                          "Values": [
+                            "stopped"
+                          ]
+                        },
+                        {
+                          "Name": "instance-id",
+                          "Values": "{% $append($InstanceIds, []) %}"
+                        }
+                      ]
+                    },
+                    "Resource": "arn:aws:states:::aws-sdk:ec2:describeInstances",
+                    "Next": "StartOtherInstances",
+                    "Output": "{% $append($states.result.Reservations[*].Instances[*].InstanceId, []) %}"
+                  },
+                  "StartOtherInstances": {
+                    "Type": "Map",
+                    "ItemProcessor": {
+                      "ProcessorConfig": {
+                        "Mode": "INLINE"
+                      },
+                      "StartAt": "DescribeOtherInstance",
+                      "States": {
+
+                        "DescribeOtherInstance": {
+                          "Type": "Task",
+                          "Arguments": {
+                            "Filters": [
+                              {
+                                "Name": "instance-id",
+                                "Values": "{% $append($states.input, []) %}"
+                              }
+                            ]
+                          },
+                          "Resource": "arn:aws:states:::aws-sdk:ec2:describeInstances",
+                          "Next": "CheckOtherIsntanceType",
+                          "Output": "{% $states.result %}"
+                        },
+                        "CheckOtherIsntanceType": {
+                          "Type": "Choice",
+                          "Choices": [
+                            {
+                              "Next": "StartOtherInstance",
+                              "Condition": "{% $count($states.input.Reservations[*].Instances[0].Tags[Key=\"AlternativeInstanceType\"]) = 0 %}",
+                              "Output": "{% $states.input.Reservations[*].Instances[*].InstanceId %}"
+                            },
+                            {
+                              "Next": "ModifyOtherInstanceAttribute",
+                              "Condition": "{% $append($split($states.input.Reservations[*].Instances[*].Tags[Key=\"AlternativeInstanceType\"].Value, \",\"),[])[0] != $states.input.Reservations[*].Instances[*].InstanceType %}",
+                              "Output": {
+                                "OriginalInstanceType": "{% $append($split($states.input.Reservations[*].Instances[*].Tags[Key=\"AlternativeInstanceType\"].Value, \",\"),[])[0] %}",
+                                "InstanceId": "{% $states.input.Reservations[*].Instances[*].InstanceId %}"
+                              }
+                            }
+                          ],
+                          "Default": "StartOtherInstance",
+                          "Output": "{% $states.input.Reservations[*].Instances[*].InstanceId %}"
+                        },
+                        "ModifyOtherInstanceAttribute": {
+                          "Type": "Task",
+                          "Arguments": {
+                            "InstanceId": "{% $states.input.InstanceId %}",
+                            "InstanceType": {
+                              "Value": "{% $states.input.OriginalInstanceType %}"
+                            }
+                          },
+                          "Resource": "arn:aws:states:::aws-sdk:ec2:modifyInstanceAttribute",
+                          "Next": "StartOtherInstance",
+                          "Output": "{% $states.input.InstanceId %}"
+                        },
+                        "RecoveryOtherInsufficientCapacity": {
+                          "Arguments": {
+                            "FunctionName": !GetAtt ICERecoveryFunction.Arn,
+                            "Payload": "{% $states.input %}"
+                          },
+                          "End": true,
+                          "Output": "{% $states.result.Payload %}",
+                          "Resource": "arn:aws:states:::lambda:invoke",
+                          "Retry": [
+                            {
+                              "BackoffRate": 2,
+                              "ErrorEquals": [
+                                "Lambda.ServiceException",
+                                "Lambda.AWSLambdaException",
+                                "Lambda.SdkClientException",
+                                "Lambda.TooManyRequestsException"
+                              ],
+                              "IntervalSeconds": 1,
+                              "JitterStrategy": "FULL",
+                              "MaxAttempts": 3
+                            }
+                          ],
+                          "Type": "Task",
+                          "Catch": [
+                            {
+                              "ErrorEquals": [
+                                "Sandbox.Timedout"
+                              ],
+                              "Next": "InstancePass"
+                            }
+                          ]
+                        },
+                        "InstancePass": {
+                          "Type": "Pass",
+                          "End": true
+                        },
+                        "StartOtherInstance": {
+                          "Arguments": {
+                            "FunctionName": !GetAtt StartInstancesFunction.Arn,
+                            "Payload": "{% {\"InstanceId\": $states.input} %}"
+                          },
+                          "Next": "CheckResult",
+                          "Output": "{% $merge([$states.result.Payload, {\"InstanceId\": $states.input}]) %}",
+                          "Resource": "arn:aws:states:::lambda:invoke",
+                          "Retry": [
+                            {
+                              "BackoffRate": 2,
+                              "ErrorEquals": [
+                                "Lambda.ServiceException",
+                                "Lambda.AWSLambdaException",
+                                "Lambda.SdkClientException",
+                                "Lambda.TooManyRequestsException"
+                              ],
+                              "IntervalSeconds": 1,
+                              "JitterStrategy": "FULL",
+                              "MaxAttempts": 3
+                            }
+                          ],
+                          "Type": "Task"
+                        },
+                        "CheckResult": {
+                          "Type": "Choice",
+                          "Choices": [
+                            {
+                              "Condition": "{% $states.input.result = \"error\" and $states.input.errorCode = \"InsufficientInstanceCapacity\" %}",
+                              "Next": "RecoveryOtherInsufficientCapacity"
+                            },
+                            {
+                              "Condition": "{% $states.input.result = \"success\" %}",
+                              "Next": "InstancePass"
+                            }
+                          ],
+                          "Default": "InstancePass"
+                        }
+                      }
+                    },
+                    "End": true,
+                    "MaxConcurrency": 1
+                  }
+                }
+              },
+              {
+                "StartAt": "GetTargetServices",
+                "States": {
+                  "GetTargetServices": {
+                    "Type": "Task",
+                    "Arguments": {
+                      "GroupName": !Ref ResourceGroup,
+                      "Filters": [
+                        {
+                          "Name": "resource-type",
+                          "Values": [
+                            "AWS::ECS::Service"
+                          ]
+                        }
+                      ]
+                    },
+                    "Resource": "arn:aws:states:::aws-sdk:resourcegroups:listGroupResources",
+                    "Output": "{% $append($distinct($states.result.ResourceIdentifiers[*].ResourceArn), []) %}",
+                    "Next": "MapServices"
+                  },
+                  "MapServices": {
+                    "Type": "Map",
+                    "ItemProcessor": {
+                      "ProcessorConfig": {
+                        "Mode": "INLINE"
+                      },
+                      "StartAt": "DescribeServices",
+                      "States": {
+                        "DescribeServices": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::aws-sdk:ecs:describeServices",
+                          "Next": "CheckServiceStatus",
+                          "Arguments": {
+                            "Services": "{% $append($map($states.input,function($v) { $string($split($v, \"/\")[2])}), []) %}",
+                            "Cluster": "{% $string($split($states.input, \"/\")[1]) %}",
+                            "Include": [
+                              "TAGS"
+                            ]
+                          },
+                          "Output": {
+                            "Service": "{% $string($map($states.input,function($v) { $string($split($v, \"/\")[2])})) %}",
+                            "Cluster": "{% $string($split($states.input, \"/\")[1]) %}",
+                            "DesiredCount": "{% $number($states.result.Services[*].Tags[Key=\"DesiredCount\"].Value) %}",
+                            "Status": "{% $states.result.Services[*].Status %}"
+                          }
+                        },
+                        "CheckServiceStatus": {
+                          "Type": "Choice",
+                          "Choices": [
+                            {
+                              "Next": "PassUpdate",
+                              "Condition": "{% $states.input.Status != \"ACTIVE\" %}"
+                            },
+                            {
+                              "Next": "UpdateService",
+                              "Condition": "{% $states.input.Status = \"ACTIVE\" %}"
+                            }
+                          ],
+                          "Default": "PassUpdate"
+                        },
+                        "PassUpdate": {
+                          "Type": "Pass",
+                          "End": true
+                        },
+                        "UpdateService": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::aws-sdk:ecs:updateService",
+                          "End": true,
+                          "Arguments": {
+                            "Service": "{% $states.input.Service %}",
+                            "Cluster": "{% $states.input.Cluster %}",
+                            "DesiredCount": "{% $states.input.DesiredCount %}"
+                          }
+                        }
+                      }
+                    },
+                    "End": true
+                  }
+                }
+              }
+            ],
+            "Next": "StatusCheck",
+            "Output": '{"action": "start"}'
+          },
+          "StatusCheck": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Output": "{% $states.result.Payload %}",
+            "Arguments": {
+              "FunctionName": !GetAtt SystemStatusCheckFunction.Arn,
+              "Payload": "{% $states.input %}"
+              },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 3,
+                "BackoffRate": 2,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "End": true
+          },
+        },
+        "QueryLanguage": "JSONata"
+      }
+      RoleArn: !GetAtt IAMStateMachineRole.Arn
+      StateMachineName: !Sub "${NamePrefix}-statemachine-start-${AWS::StackName}"
+      StateMachineType: "STANDARD"
+      Tags: 
+        - Key: "Name"
+          Value: !Sub "${NamePrefix}-statemachine-start-${AWS::StackName}"
+
+# ------------------------------------------------------------#
+#  SNS
+# ------------------------------------------------------------#
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${NamePrefix}-sns-notification-${AWS::StackName}"
+      DisplayName: !Sub "${NamePrefix}-sns-notification-${AWS::StackName}"
+      KmsMasterKeyId: "alias/aws/sns"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref EmailAddress
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-sns-notification-${AWS::StackName}"
+
+# ------------------------------------------------------------#
+#  EventBridge
+# ------------------------------------------------------------#  
+# AutoStop
+  AutoStopTrigger:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      FlexibleTimeWindow: 
+        Mode: "OFF"
+      Name: !Sub "${NamePrefix}-scheduler-stop-${AWS::StackName}"
+      ScheduleExpression: !Ref AutoStopScheduling
+      ScheduleExpressionTimezone: "Asia/Tokyo"
+      State: "ENABLED"
+      Target: 
+        Arn: !GetAtt AutoStopStatemachine.Arn
+        RoleArn: !GetAtt IAMEventBridge.Arn
+
+# AutoStart
+  AutoStartTrigger:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      FlexibleTimeWindow: 
+        Mode: "OFF"
+      Name: !Sub "${NamePrefix}-scheduler-start-${AWS::StackName}"
+      ScheduleExpression: !Ref AutoStartScheduling
+      ScheduleExpressionTimezone: "Asia/Tokyo"
+      State: "ENABLED"
+      Target: 
+        Arn: !GetAtt AutoStartStatemachine.Arn
+        RoleArn: !GetAtt IAMEventBridge.Arn
+
+# Notification
+  StepFunctionsStatusChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${NamePrefix}-eventbridge-notification-${AWS::StackName}"
+      Description: "Rule to detect Step Functions statemachine for autostop/start changes status"
+      EventPattern:
+        source:
+          - "aws.states"
+        detail-type:
+          - "Step Functions Execution Status Change"
+        detail:
+          stateMachineArn:
+            - !GetAtt AutoStartStatemachine.Arn
+            - !GetAtt AutoStopStatemachine.Arn
+          status:
+            - "SUCCEEDED"
+            - "FAILED"
+      State: ENABLED
+      Targets:
+        - Arn: !Ref NotificationTopic
+          Id: "StepFunctionsStatusNotificationTarget"
+          RoleArn: !GetAtt IAMEventBridgeRule.Arn
+          InputTransformer:
+            InputPathsMap:
+              "executionArn": "$.detail.executionArn"
+              "stateMachineName": "$.detail.stateMachineArn"
+              "status": "$.detail.status"
+              "startDate": "$.detail.startDate"
+              "stopDate": "$.detail.stopDate"
+            InputTemplate: |
+              {
+                "executionArn": <executionArn>,
+                "stateMachine": <stateMachineName>,
+                "executionStatus": <status>,
+                "startTime": <startDate>,
+                "endTime": <stopDate>,
+                "message": "Step Functions execution <executionArn> has changed status to <status>"
+              }
