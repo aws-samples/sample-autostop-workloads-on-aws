@@ -67,6 +67,7 @@ Value: true
 ### 3. (Option) Insufficient Capacity Error発生時に代替インスタンスでの起動を試す場合
 
 Insufficient Capacity Error 発生時に代替インスタスタイプで起動する場合はリソースに以下のタグを追加を追加してください。  
+代替インスタンスへの切り替えは先頭から順番に試行されます。  
 ※Value は適宜適切なインスタンスタイプの候補に置き換えてください。  
 ```
 Key: AlternativeInstanceType
